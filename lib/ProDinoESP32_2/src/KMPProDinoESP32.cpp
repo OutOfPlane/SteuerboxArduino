@@ -59,8 +59,8 @@ const int OPTOIN_PINS[OPTOIN_COUNT] = { IN1PIN, IN2PIN, IN3PIN, IN4PIN };
 NeoPixelBus<NeoGrbFeature, NeoEsp32BitBang800KbpsMethod> _statusLed(MaxStatusLedPixelCount, StatusLedPin);
 
 // W5500 pins.
-#define W5500ResetPin 12  // I12
-#define W5500CSPin    33 // IO33
+#define W5500ResetPin 15  // IO12-->Default
+#define W5500CSPin    4 // IO33-->Default
 
 // RS485 pins. Serial1.
 #define RS485Pin      2   // IO12
