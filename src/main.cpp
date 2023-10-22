@@ -10,6 +10,8 @@
 #include <DNSServer.h>
 #include <WebServer.h>
 
+#include <EEPROM.h>
+
 #define FW_VERS "1.0.0"
 
 #define SSID_NAME "PeanutPay"
@@ -18,12 +20,41 @@
 EthernetClient ethClient;
 WiFiClient wifiClient;
 
+enum connectionType : uint8_t
+{
+  conn_none,
+  conn_wifi,
+  conn_eth_dhcp,
+  conn_eth_man
+};
+
+typedef struct
+{
+  enum connectionType type;
+
+  union
+  {
+    struct
+    {
+      char ssid[64];
+      char pwd[64];
+    } wifiConfig;
+
+    struct
+    {
+      uint32_t ip;
+      uint32_t gw;
+      uint32_t dns;
+      uint32_t nm;
+    } ethConfig;
+  };
+
+} networkConfiguration;
+
 // Define text colors.
 const char GREEN[] = "#90EE90"; // LightGreen
 const char RED[] = "#FF4500";   // OrangeRed
 const char GRAY[] = "#808080";
-
-const char *serverStateStr = "keine Verbindung";
 
 char deviceID[13];
 uint8_t wifiMac[8];
@@ -42,6 +73,8 @@ DNSServer dnsServer;
 WebServer webServer;
 
 char sensorDataBuff[1024] = {0};
+
+networkConfiguration netConfig;
 
 void updateSensorData();
 
@@ -146,55 +179,81 @@ boolean captivePortal()
 
 char pageBuff[1024];
 
-
 void applyConfig()
 {
-  if(webServer.arg("type") == "wifi")
+  if (webServer.arg("type") == "wifi")
   {
     Serial.println("Wifi Config!");
     Serial.printf("SSID: %s\r\n", webServer.arg("s").c_str());
     Serial.printf("PWD: %s\r\n", webServer.arg("m").c_str());
     WiFi.begin(webServer.arg("s"), webServer.arg("m"));
+
+    netConfig.type = conn_wifi;
+    strcpy(netConfig.wifiConfig.ssid, webServer.arg("s").c_str());
+    strcpy(netConfig.wifiConfig.pwd, webServer.arg("m").c_str());
+    
+    if (EEPROM.begin(sizeof(netConfig)))
+    {
+      EEPROM.put<networkConfiguration>(0, netConfig);
+      EEPROM.end();
+    }
   }
 
-  if(webServer.arg("type") == "eth")
+  if (webServer.arg("type") == "eth")
   {
     Serial.println("Ethernet DHCP Config!");
     Ethernet.begin(wifiMac, 10000);
+    netConfig.type = conn_eth_dhcp;
+    if (EEPROM.begin(sizeof(netConfig)))
+    {
+      EEPROM.put<networkConfiguration>(0, netConfig);
+      EEPROM.end();
+    }
   }
 
-  if(webServer.arg("type") == "ethman")
+  if (webServer.arg("type") == "ethman")
   {
     Serial.println("Ethernet manual Config!");
     IPAddress ip, gateway, dns, netmask;
 
-    if(!ip.fromString(webServer.arg("ip")))
+    if (!ip.fromString(webServer.arg("ip")))
     {
       webServer.sendContent("<h2>IP Adresse fehlerhaft</h2>");
       return;
     }
 
-    if(!gateway.fromString(webServer.arg("ip")))
+    if (!gateway.fromString(webServer.arg("ip")))
     {
       webServer.sendContent("<h2>Gateway Adresse fehlerhaft</h2>");
       return;
     }
 
-    if(!dns.fromString(webServer.arg("ip")))
+    if (!dns.fromString(webServer.arg("ip")))
     {
       webServer.sendContent("<h2>DNS Adresse fehlerhaft</h2>");
       return;
     }
 
-    if(!netmask.fromString(webServer.arg("ip")))
+    if (!netmask.fromString(webServer.arg("ip")))
     {
       webServer.sendContent("<h2>Netmask fehlerhaft</h2>");
       return;
     }
-    
+
+
+    netConfig.type = conn_eth_man;
+    netConfig.ethConfig.ip = ip;
+    netConfig.ethConfig.dns = dns;
+    netConfig.ethConfig.gw = gateway;
+    netConfig.ethConfig.nm = netmask;
+    if (EEPROM.begin(sizeof(netConfig)))
+    {
+      EEPROM.put<networkConfiguration>(0, netConfig);
+      EEPROM.end();
+    }
+
     Ethernet.begin(wifiMac, ip, dns, gateway, netmask);
   }
-  
 }
 
 void handleRoot()
@@ -203,14 +262,12 @@ void handleRoot()
   {
     return;
   }
-  
 
   webServer.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   webServer.sendHeader("Pragma", "no-cache");
   webServer.sendHeader("Expires", "-1");
   webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
   webServer.send(200, "text/html", "");
-
 
   webServer.sendContent(webpageHeader1);
   webServer.sendContent("Steuerbox Config");
@@ -229,13 +286,18 @@ Netzwerkeinstellungen
           deviceID);
   webServer.sendContent(pageBuff);
 
-  if(webServer.method() == HTTPMethod::HTTP_POST)
+  if (webServer.method() == HTTPMethod::HTTP_POST)
   {
     applyConfig();
   }
 
-
   webServer.sendContent(webpageDataTable);
+
+  webServer.sendContent(R"EOF(
+<button onclick="window.location.href='/disable';">
+AP deaktivieren
+</button>)EOF");
+
   webServer.sendContent(webpageTableUpdateScript);
   webServer.sendContent("</div>");
   webServer.sendContent(webpageFooter);
@@ -252,7 +314,6 @@ void handleConfig()
   webServer.sendHeader("Expires", "-1");
   webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
   webServer.send(200, "text/html", "");
-
 
   webServer.sendContent(webpageHeader1);
   webServer.sendContent("Steuerbox Config");
@@ -296,7 +357,6 @@ void handleConfigWiFi()
   webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
   webServer.send(200, "text/html", "");
 
-
   webServer.sendContent(webpageHeader1);
   webServer.sendContent("Steuerbox Config");
   webServer.sendContent(webpageHeader2);
@@ -336,7 +396,6 @@ void handleConfigEthDHCP()
   webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
   webServer.send(200, "text/html", "");
 
-
   webServer.sendContent(webpageHeader1);
   webServer.sendContent("Steuerbox Config");
   webServer.sendContent(webpageHeader2);
@@ -374,7 +433,6 @@ void handleConfigEthMan()
   webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
   webServer.send(200, "text/html", "");
 
-
   webServer.sendContent(webpageHeader1);
   webServer.sendContent("Steuerbox Config");
   webServer.sendContent(webpageHeader2);
@@ -402,6 +460,39 @@ void handleConfigEthMan()
   webServer.sendContent(pageBuff);
   webServer.sendContent("</div>");
   webServer.sendContent(webpageFooter);
+}
+
+void handleDisable()
+{
+  if (captivePortal())
+  {
+    return;
+  }
+  webServer.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  webServer.sendHeader("Pragma", "no-cache");
+  webServer.sendHeader("Expires", "-1");
+  webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  webServer.send(200, "text/html", "");
+
+  webServer.sendContent(webpageHeader1);
+  webServer.sendContent("Steuerbox Config");
+  webServer.sendContent(webpageHeader2);
+
+  sprintf(pageBuff, R"EOF(
+<nav>
+<b>Steuerbox</b>
+%s
+</nav>
+<div>
+<h1>Accesspoint deaktiviert!</h1><br>
+<p>Bis Bald!</p>
+)EOF",
+          deviceID);
+  webServer.sendContent(pageBuff);
+  webServer.sendContent("</div>");
+  webServer.sendContent(webpageFooter);
+
+  WiFi.softAPdisconnect(true);
 }
 
 void dataRequestHandler()
@@ -437,9 +528,9 @@ void handleNotFound()
 
 void setup()
 {
-  delay(5000);
+  delay(3000);
   Serial.begin(115200);
-  Serial.println("The example via WiFi and Ethernet is starting...");
+  Serial.printf("Steuerbox FW: %s\r\n", FW_VERS);
 
   // Init Dino board.
   KMPProDinoESP32.begin(ProDino_ESP32_Ethernet);
@@ -449,19 +540,7 @@ void setup()
   KMPProDinoESP32.setAllRelaysOff();
 
   // Connect to WiFi network
-  WiFi.begin(SSID_NAME, SSID_PASSWORD);
-  Serial.print("\n\rConnecting");
-
-  // Wait for connection
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println();
-  Serial.print("WiFi IP: ");
-  Serial.print(WiFi.localIP());
+  WiFi.begin("VisioVerdis", "visioverdis");
 
   uint8_t wifiMac[8];
   WiFi.macAddress(wifiMac);
@@ -472,12 +551,13 @@ void setup()
   Serial.printf("Hallo, Ich bin: %s\r\n", deviceID);
 
   WiFi.softAPConfig(apIP, apIP, netMsk);
-  WiFi.softAP(("VV_SB_" + String(deviceID)).c_str(), "visioverdis");
+  WiFi.setAutoReconnect(true);
 
   dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
   dnsServer.start(DNS_PORT, "*", apIP);
 
   webServer.on("/", handleRoot);
+  webServer.on("/disable", handleDisable);
   webServer.on("/config", handleConfig);
   webServer.on("/config_wifi", handleConfigWiFi);
   webServer.on("/config_eth_dhcp", handleConfigEthDHCP);
@@ -488,20 +568,43 @@ void setup()
   webServer.begin(); // Web server start
   Serial.println("HTTP server started");
 
-  IPAddress ipa(100, 100, 100, 5);
-  IPAddress dns(100, 100, 100, 1);
-  IPAddress gat(100, 100, 100, 1);
-  IPAddress nma(255, 255, 255, 0);
-
-  // Start the Ethernet connection and the server.
-  // Ethernet.begin(wifiMac, ipa, dns, gat, nma);
-  if (Ethernet.begin(wifiMac, 10000) == 0)
+  if (EEPROM.begin(sizeof(netConfig)))
   {
-    Serial.println("Failed to configure Ethernet using DHCP");
+    EEPROM.get<networkConfiguration>(0, netConfig);
+    EEPROM.end();
   }
 
-  Serial.println("Ethernet IP:");
-  Serial.print(Ethernet.localIP());
+  if (netConfig.type == conn_none)
+  {
+    Serial.println("No Config");
+    WiFi.softAP(("VV_SB_" + String(deviceID)).c_str(), "visioverdis");
+  }
+
+  if (netConfig.type == conn_wifi)
+  {
+    Serial.println("WiFi Config");
+    WiFi.begin("VisioVerdis", "VisioVerdis");
+  }
+
+  if (netConfig.type == conn_eth_dhcp)
+  {
+    Serial.println("DHCP Config");
+    if (Ethernet.begin(wifiMac, 10000) == 0)
+    {
+      Serial.println("Failed to configure Ethernet using DHCP");
+      WiFi.softAP(("VV_SB_" + String(deviceID)).c_str(), "visioverdis");
+    }
+    Serial.println("Ethernet IP:");
+    Serial.print(Ethernet.localIP());
+  }
+
+  if (netConfig.type == conn_eth_man)
+  {
+    Serial.println("Eth Man Config");
+    Ethernet.begin(wifiMac, IPAddress(netConfig.ethConfig.ip), IPAddress(netConfig.ethConfig.dns), IPAddress(netConfig.ethConfig.gw), IPAddress(netConfig.ethConfig.nm));
+    Serial.println("Ethernet IP:");
+    Serial.print(Ethernet.localIP());
+  }
 
   KMPProDinoESP32.offStatusLed();
 }
@@ -514,7 +617,9 @@ uint32_t updateSensorMillis = 0;
 char respBuff[1000];
 char reqBuff[1000];
 
-Client *currentClient = &wifiClient;
+uint8_t serverStatus = 0;
+
+Client *currentClient = nullptr;
 
 typedef enum
 {
@@ -532,8 +637,34 @@ actionState cActionState;
 
 void loop()
 {
-  if ((millis() - pollMillis > 30000) && !pendingAction)
+  currentClient = nullptr;
+  if (netConfig.type == conn_wifi)
   {
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      currentClient = &wifiClient;
+    }
+    else
+    {
+      serverStatus = 0;
+    }
+  }
+
+  if (netConfig.type == conn_eth_dhcp || netConfig.type == conn_eth_man)
+  {
+    if (Ethernet.linkStatus() == LinkON)
+    {
+      currentClient = &ethClient;
+    }
+    else
+    {
+      serverStatus = 0;
+    }
+  }
+
+  if ((millis() - pollMillis > 30000) && !pendingAction && currentClient)
+  {
+    serverStatus = 0;
     pollMillis = millis();
     sprintf(reqBuff, "mac=%s", deviceID);
     if (requestServer(currentClient, "http://api.graviplant-online.de", "/steuerbox/v1/actions/", reqBuff, respBuff, 2000))
@@ -546,6 +677,7 @@ void loop()
         Serial.println("Valid JSON!");
         if (myDoc.containsKey("actionid"))
         {
+          serverStatus = 1;
           // valid response
           actionID = myDoc["actionid"];
           action = myDoc["action"];
@@ -563,8 +695,9 @@ void loop()
     }
   }
 
-  if (millis() - telemetryMillis > (10 * 1000))
+  if ((millis() - telemetryMillis > (10 * 1000)) && currentClient)
   {
+    serverStatus = 0;
     telemetryMillis = millis();
     sprintf(reqBuff, "mac=%s&a0=%d&a1=%d&a2=%d&a3=%d", deviceID, readPinCal(PIN_ADC0), readPinCal(PIN_ADC1), readPinCal(PIN_ADC2), readPinCal(PIN_ADC3));
     if (requestServer(currentClient, "http://api.graviplant-online.de", "/steuerbox/v1/telemetry/", reqBuff, respBuff, 2000))
@@ -577,6 +710,7 @@ void loop()
         String erg = myDoc["result"];
         if (erg == "OK")
         {
+          serverStatus = 1;
           Serial.println("Transmit Success");
         }
       }
@@ -644,7 +778,11 @@ void loop()
     break;
   }
 
-  // Ethernet.maintain();
+  if (netConfig.type == conn_eth_dhcp || netConfig.type == conn_eth_man)
+  {
+    Ethernet.maintain();
+  }
+
   dnsServer.processNextRequest();
   webServer.handleClient();
   // put your main code here, to run repeatedly:
@@ -682,7 +820,7 @@ void updateSensorData()
 "fwvers":"%s"
 })EOF",
           deviceID,
-          serverStateStr,
+          serverStatus ? "Verbunden" : "Getrennt",
           WiFi.SSID().c_str(),
           WiFi.localIP().toString().c_str(),
           WiFi.status(),

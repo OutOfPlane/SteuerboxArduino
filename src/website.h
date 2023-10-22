@@ -152,6 +152,10 @@ if(key.includes("_p"))
 document.getElementById(key).innerHTML = data[key] + " %";
 if(key.includes("_s"))
 document.getElementById(key).innerHTML = ["AUS", "AN"][data[key]];
+if(key.includes("_y"))
+document.getElementById(key).innerHTML = ["Unbek.", "Verbunden", "Getrennt"][data[key]];
+if(key.includes("_x"))
+document.getElementById(key).innerHTML = ["Bereit", "Nicht erreichbar", "Scan abgesch.", "Verbunden", "Verb. fehlgesch.", "Verb. verloren", "Getrennt"][data[key]];
 if(key.includes("_v"))
 document.getElementById(key).innerHTML = ["LOW", "HIGH"][data[key]];
 if(key.includes("_d"))
