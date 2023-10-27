@@ -12,7 +12,7 @@
 
 #include <EEPROM.h>
 
-#define FW_VERS "1.0.0"
+#define FW_VERS "1.0.2"
 
 #define SSID_NAME "PeanutPay"
 #define SSID_PASSWORD "PeanutPay"
@@ -77,6 +77,11 @@ char sensorDataBuff[1024] = {0};
 networkConfiguration netConfig;
 
 void updateSensorData();
+
+uint32_t adc0_filt = 0;
+uint32_t adc1_filt = 0;
+uint32_t adc2_filt = 0;
+uint32_t adc3_filt = 0;
 
 uint32_t readPinCal(uint8_t pin)
 {
@@ -529,6 +534,15 @@ void handleNotFound()
   webServer.send(404, "text/html", p);
 }
 
+uint32_t getIOState(uint32_t channel)
+{
+  if (KMPProDinoESP32.getRelayState(channel))
+  {
+    return 1;
+  }
+  return 0;
+}
+
 void setup()
 {
   delay(3000);
@@ -578,19 +592,12 @@ void setup()
     EEPROM.end();
   }
 
-  if (netConfig.type == conn_none)
-  {
-    Serial.println("No Config");
-    WiFi.softAP(("VV_SB_" + String(deviceID)).c_str(), "visioverdis");
-  }
-
   if (netConfig.type == conn_wifi)
   {
     Serial.println("WiFi Config");
     WiFi.begin(netConfig.wifiConfig.ssid, netConfig.wifiConfig.pwd);
   }
-
-  if (netConfig.type == conn_eth_dhcp)
+  else if (netConfig.type == conn_eth_dhcp)
   {
     Serial.println("DHCP Config");
     if (Ethernet.begin(wifiMac, 10000) == 0)
@@ -600,13 +607,17 @@ void setup()
     Serial.println("Ethernet IP:");
     Serial.print(Ethernet.localIP());
   }
-
-  if (netConfig.type == conn_eth_man)
+  else if (netConfig.type == conn_eth_man)
   {
     Serial.println("Eth Man Config");
     Ethernet.begin(wifiMac, IPAddress(netConfig.ethConfig.ip), IPAddress(netConfig.ethConfig.dns), IPAddress(netConfig.ethConfig.gw), IPAddress(netConfig.ethConfig.nm));
     Serial.println("Ethernet IP:");
     Serial.print(Ethernet.localIP());
+  }
+  else
+  {
+    Serial.println("No Config");
+    WiFi.softAP(("VV_SB_" + String(deviceID)).c_str(), "visioverdis");
   }
 
   KMPProDinoESP32.setStatusLed(red);
@@ -628,15 +639,18 @@ Client *currentClient = nullptr;
 typedef enum
 {
   ACT_IDLE,
-  ACT_PREPARED,
-  ACT_STARTING,
-  ACT_RUNNING,
-  ACT_STOPPING
+  ACT_START_CHANGE,
+  ACT_CHANGE,
+  ACT_START_PULSE,
+  ACT_PULSE_HIGH,
+  ACT_PULSE_HOLD,
+  ACT_PULSE_LOW
 } actionState;
 
 bool pendingAction = false;
-int actionID = -1;
-int action = -1;
+int actionCH = -1;
+int actionType = -1;
+int actionValue = -1;
 actionState cActionState;
 
 void loop()
@@ -681,15 +695,16 @@ void loop()
       if (deserializeJson(myDoc, respBuff) == DeserializationError::Ok)
       {
         Serial.println("Valid JSON!");
-        if (myDoc.containsKey("actionid"))
+        if (myDoc.containsKey("channel"))
         {
           serverStatus = 1;
           KMPProDinoESP32.setStatusLed(green);
           lastServerOnline = millis();
           // valid response
-          actionID = myDoc["actionid"];
-          action = myDoc["action"];
-          if (actionID != -1)
+          actionCH = myDoc["channel"];
+          actionType = myDoc["action_type"];
+          actionValue = myDoc["action_value"];
+          if (actionType != -1)
           {
             pendingAction = true;
             Serial.println("Pending Action!");
@@ -704,11 +719,11 @@ void loop()
     }
   }
 
-  if ((millis() - telemetryMillis > (30 * 60 * 1000)) && currentClient)
+  if ((millis() - telemetryMillis > (60 * 1000)) && currentClient)
   {
     serverStatus = 0;
     telemetryMillis = millis();
-    sprintf(reqBuff, "mac=%s&a0=%d&a1=%d&a2=%d&a3=%d", deviceID, readPinCal(PIN_ADC0), readPinCal(PIN_ADC1), readPinCal(PIN_ADC2), readPinCal(PIN_ADC3));
+    sprintf(reqBuff, "mac=%s&a0=%d&a1=%d&a2=%d&a3=%d", deviceID, adc0_filt, adc1_filt, adc2_filt, adc3_filt);
     if (requestServer(currentClient, "http://api.graviplant-online.de", "/steuerbox/v1/telemetry/", reqBuff, respBuff, 2000))
     {
       Serial.println("Connection Succeeded");
@@ -743,88 +758,122 @@ void loop()
   {
   case ACT_IDLE:
     if (pendingAction)
-      cActionState = ACT_PREPARED;
+    {
+      if (actionCH < 4 && actionCH >= 0)
+      {
+        if (actionType == 0)
+        {
+          cActionState = ACT_START_PULSE;
+        }
+        if (actionType == 1)
+        {
+          cActionState = ACT_START_CHANGE;
+        }
+        if (actionType == 99)
+        {
+          // recovery mode
+          if (apDisabled)
+          {
+            apDisabled = 0;
+            Serial.println("Starting Recovery Mode!");
+            WiFi.softAP(("VV_SB_" + String(deviceID)).c_str(), "visioverdis");
+          }
+        }
+      }
+
+      pendingAction = false;
+      actionMillis = millis();
+    }
+
     break;
 
-  case ACT_PREPARED:
-    if (actionID == 0)
-    {
-      sprintf(reqBuff, "mac=%s&action=%d&value=%d", deviceID, actionID, 0);
-      cActionState = ACT_STARTING;
-    }
-    else if (actionID == 1)
-    {
-      if (action)
-      {
-        sprintf(reqBuff, "mac=%s&action=%d&value=%d", deviceID, actionID, 0);
-      }
-      else
-      {
-        sprintf(reqBuff, "mac=%s&action=%d&value=%d", deviceID, actionID, 1);
-      }
-      cActionState = ACT_STARTING;
-    }
-    else if (actionID == 99)
-    {
-      //enable recovery mode from server
-      sprintf(reqBuff, "mac=%s&action=%d&value=%d", deviceID, actionID, action);
-      cActionState = ACT_IDLE;
-      pendingAction = false;
-    }
-    else
-    {
-      sprintf(reqBuff, "mac=%s&action=%d&value=%d", deviceID, actionID, -1);
-      cActionState = ACT_IDLE;
-      pendingAction = false;
-    }
-
-    requestServer(currentClient, "http://api.graviplant-online.de", "/steuerbox/v1/actionLog/", reqBuff, respBuff, 2000);
-    Serial.println(respBuff);
-    actionMillis = millis();
-    break;
-
-  case ACT_STARTING:
+  case ACT_START_PULSE:
     if (millis() - actionMillis > 1000)
     {
-      if (actionID == 0)
-      {
-        sprintf(reqBuff, "mac=%s&action=%d&value=%d", deviceID, actionID, 1);
-        KMPProDinoESP32.setRelayState(Relay1, true);
-        cActionState = ACT_RUNNING;
-      }
-      if (actionID == 1)
-      {
-        sprintf(reqBuff, "mac=%s&action=%d&value=%d", deviceID, actionID, action);
-        KMPProDinoESP32.setRelayState(Relay2, action);
-        cActionState = ACT_IDLE;
-        pendingAction = false;
-      }
-
-      requestServer(currentClient, "http://api.graviplant-online.de", "/steuerbox/v1/actionLog/", reqBuff, respBuff, 2000);
       actionMillis = millis();
+
+      sprintf(reqBuff, "mac=%s&channel=%d&value=%d", deviceID, actionCH, 0);
+      requestServer(currentClient, "http://api.graviplant-online.de", "/steuerbox/v1/actionLog/", reqBuff, respBuff, 2000);
+
+      Serial.println(respBuff);
+
+      cActionState = ACT_PULSE_HIGH;
     }
+
     break;
 
-  case ACT_RUNNING:
-    if (millis() - actionMillis > action * 1000)
-    {
-      sprintf(reqBuff, "mac=%s&action=%d&value=%d", deviceID, actionID, 1);
-      requestServer(currentClient, "http://api.graviplant-online.de", "/steuerbox/v1/actionLog/", reqBuff, respBuff, 2000);
-      cActionState = ACT_STOPPING;
-      actionMillis = millis();
-    }
-    break;
-
-  case ACT_STOPPING:
+  case ACT_PULSE_HIGH:
     if (millis() - actionMillis > 1000)
     {
-      sprintf(reqBuff, "mac=%s&action=%d&value=%d", deviceID, actionID, 0);
-      requestServer(currentClient, "http://api.graviplant-online.de", "/steuerbox/v1/actionLog/", reqBuff, respBuff, 2000);
-      cActionState = ACT_IDLE;
       actionMillis = millis();
-      pendingAction = false;
-      KMPProDinoESP32.setRelayState(Relay1, false);
+      KMPProDinoESP32.setRelayState(actionCH, 1);
+
+      sprintf(reqBuff, "mac=%s&channel=%d&value=%d", deviceID, actionCH, 1);
+      requestServer(currentClient, "http://api.graviplant-online.de", "/steuerbox/v1/actionLog/", reqBuff, respBuff, 2000);
+
+      Serial.println(respBuff);
+
+      cActionState = ACT_PULSE_HOLD;
     }
+    break;
+
+  case ACT_PULSE_HOLD:
+    if (millis() - actionMillis > actionValue * 1000)
+    {
+      actionMillis = millis();
+
+      sprintf(reqBuff, "mac=%s&channel=%d&value=%d", deviceID, actionCH, 1);
+      requestServer(currentClient, "http://api.graviplant-online.de", "/steuerbox/v1/actionLog/", reqBuff, respBuff, 2000);
+
+      Serial.println(respBuff);
+
+      cActionState = ACT_PULSE_LOW;
+    }
+    break;
+
+  case ACT_PULSE_LOW:
+    if (millis() - actionMillis > 1000)
+    {
+      actionMillis = millis();
+
+      sprintf(reqBuff, "mac=%s&channel=%d&value=%d", deviceID, actionCH, 0);
+      KMPProDinoESP32.setRelayState(actionCH, 0);
+      requestServer(currentClient, "http://api.graviplant-online.de", "/steuerbox/v1/actionLog/", reqBuff, respBuff, 2000);
+
+      Serial.println(respBuff);
+
+      cActionState = ACT_IDLE;
+    }
+    break;
+
+  case ACT_START_CHANGE:
+    if (millis() - actionMillis > 1000)
+    {
+      actionMillis = millis();
+      
+      sprintf(reqBuff, "mac=%s&channel=%d&value=%d", deviceID, actionCH, getIOState(actionCH));
+      requestServer(currentClient, "http://api.graviplant-online.de", "/steuerbox/v1/actionLog/", reqBuff, respBuff, 2000);
+      
+      Serial.println(respBuff);
+          
+      cActionState = ACT_CHANGE;
+    }
+    break;
+
+  case ACT_CHANGE:
+    if (millis() - actionMillis > 1000)
+    {
+      actionMillis = millis();
+
+      sprintf(reqBuff, "mac=%s&channel=%d&value=%d", deviceID, actionCH, actionValue);
+      KMPProDinoESP32.setRelayState(actionCH, actionValue);
+      requestServer(currentClient, "http://api.graviplant-online.de", "/steuerbox/v1/actionLog/", reqBuff, respBuff, 2000);
+
+      Serial.println(respBuff);
+
+      cActionState = ACT_IDLE;
+    }
+    
     break;
 
   default:
@@ -855,12 +904,17 @@ void loop()
 void updateSensorData()
 {
 
-  int32_t ain0, ain1, ain2, ain3;
+  uint32_t ain0, ain1, ain2, ain3;
 
   ain0 = readPinCal(PIN_ADC0);
   ain1 = readPinCal(PIN_ADC1);
   ain2 = readPinCal(PIN_ADC2);
   ain3 = readPinCal(PIN_ADC3);
+
+  adc0_filt = ((adc0_filt * 49) + ain0) / 50;
+  adc1_filt = ((adc1_filt * 49) + ain1) / 50;
+  adc2_filt = ((adc2_filt * 49) + ain2) / 50;
+  adc3_filt = ((adc3_filt * 49) + ain3) / 50;
 
   uint8_t sout0, sout1;
 
