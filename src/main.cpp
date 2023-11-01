@@ -59,10 +59,14 @@ const char GRAY[] = "#808080";
 char deviceID[13];
 uint8_t wifiMac[8];
 
+#define ADC0 ADC_UNIT_1
 #define PIN_ADC0 34
+#define ADC1 ADC_UNIT_1
 #define PIN_ADC1 35
-#define PIN_ADC2 39
-#define PIN_ADC3 36
+#define ADC2 ADC_UNIT_2
+#define PIN_ADC2 25
+#define ADC3 ADC_UNIT_2
+#define PIN_ADC3 26
 
 IPAddress apIP(8, 8, 8, 8);
 IPAddress netMsk(255, 255, 255, 0);
@@ -76,6 +80,20 @@ char sensorDataBuff[1024] = {0};
 
 networkConfiguration netConfig;
 
+typedef enum
+{
+  SYS_SAMPLE_DATA,
+  SYS_CONNECT_NET_START,
+  SYS_CONNECT_NET_WAIT,
+  SYS_DISCONNECT_NET,
+  SYS_TRANSMIT_DATA,
+  SYS_CONNECT_TIMEOUT,
+  SYS_AP_MODE_START,
+  SYS_AP_MODE
+} systemState;
+
+systemState cSysState = SYS_DISCONNECT_NET;
+
 void updateSensorData();
 
 uint32_t adc0_filt = 0;
@@ -83,12 +101,12 @@ uint32_t adc1_filt = 0;
 uint32_t adc2_filt = 0;
 uint32_t adc3_filt = 0;
 
-uint32_t readPinCal(uint8_t pin)
+uint32_t readPinCal(uint8_t pin, adc_unit_t adcUnit)
 {
   int adcResult = analogRead(pin);
   esp_adc_cal_characteristics_t adc_chars;
 
-  esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adc_chars);
+  esp_adc_cal_characterize(adcUnit, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adc_chars);
   return esp_adc_cal_raw_to_voltage(adcResult, &adc_chars);
 }
 
@@ -208,6 +226,7 @@ void applyConfig()
   if (webServer.arg("type") == "eth")
   {
     Serial.println("Ethernet DHCP Config!");
+    WiFi.disconnect();
     Ethernet.begin(wifiMac, 10000);
     netConfig.type = conn_eth_dhcp;
     if (EEPROM.begin(sizeof(netConfig)))
@@ -220,6 +239,7 @@ void applyConfig()
   if (webServer.arg("type") == "ethman")
   {
     Serial.println("Ethernet manual Config!");
+    WiFi.disconnect();
     IPAddress ip, gateway, dns, netmask;
 
     if (!ip.fromString(webServer.arg("ip")))
@@ -501,6 +521,7 @@ void handleDisable()
 
   WiFi.softAPdisconnect(true);
   apDisabled = 1;
+  cSysState = SYS_DISCONNECT_NET;
 }
 
 void dataRequestHandler()
@@ -603,6 +624,7 @@ void setup()
     if (Ethernet.begin(wifiMac, 10000) == 0)
     {
       Serial.println("Failed to configure Ethernet using DHCP");
+      cSysState = SYS_AP_MODE_START;
     }
     Serial.println("Ethernet IP:");
     Serial.print(Ethernet.localIP());
@@ -616,8 +638,7 @@ void setup()
   }
   else
   {
-    Serial.println("No Config");
-    WiFi.softAP(("VV_SB_" + String(deviceID)).c_str(), "visioverdis");
+    cSysState = SYS_AP_MODE_START;
   }
 
   KMPProDinoESP32.setStatusLed(red);
@@ -626,9 +647,11 @@ bool connOnce = false;
 
 uint32_t pollMillis = 0;
 uint32_t lastServerOnline = 0;
+uint32_t lastServerOffline = 0;
 uint32_t telemetryMillis = 0;
 uint32_t actionMillis = 0;
 uint32_t updateSensorMillis = 0;
+uint32_t sysStateMillis = 0;
 char respBuff[1000];
 char reqBuff[1000];
 
@@ -644,7 +667,8 @@ typedef enum
   ACT_START_PULSE,
   ACT_PULSE_HIGH,
   ACT_PULSE_HOLD,
-  ACT_PULSE_LOW
+  ACT_PULSE_LOW,
+  ACT_COMPLETED
 } actionState;
 
 bool pendingAction = false;
@@ -653,7 +677,30 @@ int actionType = -1;
 int actionValue = -1;
 actionState cActionState;
 
-void loop()
+void sampleData()
+{
+  if (millis() - updateSensorMillis > (1000))
+  {
+    updateSensorMillis = millis();
+    updateSensorData();
+  }
+}
+
+void startConnectNet()
+{
+  if (netConfig.type == conn_wifi)
+  {
+    Serial.println("WiFi Config");
+    WiFi.begin(netConfig.wifiConfig.ssid, netConfig.wifiConfig.pwd);
+  }
+}
+
+void disconnectNet()
+{
+  WiFi.mode(WIFI_OFF);
+}
+
+bool netConnected()
 {
   currentClient = nullptr;
   if (netConfig.type == conn_wifi)
@@ -661,11 +708,7 @@ void loop()
     if (WiFi.status() == WL_CONNECTED)
     {
       currentClient = &wifiClient;
-    }
-    else
-    {
-      serverStatus = 0;
-      KMPProDinoESP32.setStatusLed(red);
+      return true;
     }
   }
 
@@ -674,20 +717,48 @@ void loop()
     if (Ethernet.linkStatus() == LinkON)
     {
       currentClient = &ethClient;
+      return true;
     }
-    else
+  }
+  return false;
+}
+
+bool transmitData()
+{
+  if (currentClient)
+  {
+    serverStatus = 0;
+    sprintf(reqBuff, "mac=%s&a0=%d&a1=%d&a2=%d&a3=%d", deviceID, adc0_filt, adc1_filt, adc2_filt, adc3_filt);
+    if (requestServer(currentClient, "http://api.graviplant-online.de", "/steuerbox/v1/telemetry/", reqBuff, respBuff, 5000))
     {
-      serverStatus = 0;
-      KMPProDinoESP32.setStatusLed(red);
+      Serial.println("Connection Succeeded");
+      StaticJsonDocument<1000> myDoc;
+      Serial.println(respBuff);
+      if (deserializeJson(myDoc, respBuff) == DeserializationError::Ok)
+      {
+        String erg = myDoc["result"];
+        if (erg == "OK")
+        {
+          KMPProDinoESP32.setStatusLed(green);
+          lastServerOnline = millis();
+          Serial.println("Transmit Success");
+          return true;
+        }
+      }
     }
   }
 
-  if ((millis() - pollMillis > 30 * 1000) && !pendingAction && currentClient)
+  return false;
+}
+
+bool receiveActions()
+{
+  Serial.println("retrieve Actions");
+  if (!pendingAction && currentClient)
   {
     serverStatus = 0;
-    pollMillis = millis();
     sprintf(reqBuff, "mac=%s", deviceID);
-    if (requestServer(currentClient, "http://api.graviplant-online.de", "/steuerbox/v1/actions/", reqBuff, respBuff, 2000))
+    if (requestServer(currentClient, "http://api.graviplant-online.de", "/steuerbox/v1/actions/", reqBuff, respBuff, 5000))
     {
       Serial.println("Connection Succeeded");
       StaticJsonDocument<1000> myDoc;
@@ -697,7 +768,6 @@ void loop()
         Serial.println("Valid JSON!");
         if (myDoc.containsKey("channel"))
         {
-          serverStatus = 1;
           KMPProDinoESP32.setStatusLed(green);
           lastServerOnline = millis();
           // valid response
@@ -709,49 +779,112 @@ void loop()
             pendingAction = true;
             Serial.println("Pending Action!");
           }
+          return true;
         }
       }
     }
-    else
-    {
-      Serial.println("Connection Failed");
-      KMPProDinoESP32.setStatusLed(red);
-    }
   }
+  return false;
+}
 
-  if ((millis() - telemetryMillis > (60 * 1000)) && currentClient)
+void loop()
+{
+  switch (cSysState)
   {
-    serverStatus = 0;
-    telemetryMillis = millis();
-    sprintf(reqBuff, "mac=%s&a0=%d&a1=%d&a2=%d&a3=%d", deviceID, adc0_filt, adc1_filt, adc2_filt, adc3_filt);
-    if (requestServer(currentClient, "http://api.graviplant-online.de", "/steuerbox/v1/telemetry/", reqBuff, respBuff, 2000))
+  case SYS_SAMPLE_DATA:
+    sampleData();
+    if (millis() - sysStateMillis > 30000)
     {
-      Serial.println("Connection Succeeded");
-      StaticJsonDocument<1000> myDoc;
-      Serial.println(respBuff);
-      if (deserializeJson(myDoc, respBuff) == DeserializationError::Ok)
+      sysStateMillis = millis();
+      cSysState = SYS_CONNECT_NET_START;
+    }
+    break;
+
+  case SYS_CONNECT_NET_START:
+    startConnectNet();
+    cSysState = SYS_CONNECT_NET_WAIT;
+    break;
+
+  case SYS_CONNECT_NET_WAIT:
+    if (netConnected())
+      cSysState = SYS_TRANSMIT_DATA;
+    if (millis() - sysStateMillis > 10000)
+    {
+      sysStateMillis = millis();
+      cSysState = SYS_CONNECT_TIMEOUT;
+    }
+    break;
+
+  case SYS_TRANSMIT_DATA:
+    transmitData();
+    receiveActions();
+    KMPProDinoESP32.setStatusLed(green);
+    cSysState = SYS_DISCONNECT_NET;
+    break;
+
+  case SYS_DISCONNECT_NET:
+    if (!pendingAction)
+    {
+      disconnectNet();
+      cSysState = SYS_SAMPLE_DATA;
+    }
+    if (millis() - sysStateMillis > 10 * 60000)
+    {
+      sysStateMillis = millis();
+      cSysState = SYS_CONNECT_TIMEOUT;
+    }
+
+    break;
+
+  case SYS_AP_MODE_START:
+    apDisabled = 0;
+    Serial.println("Starting Recovery Mode!");
+    startConnectNet();
+    currentClient = nullptr;
+    if (netConfig.type == conn_wifi)
+    {
+        currentClient = &wifiClient;
+    }
+
+    if (netConfig.type == conn_eth_dhcp || netConfig.type == conn_eth_man)
+    {
+        currentClient = &ethClient;
+    }
+    WiFi.softAP(("VV_SB_" + String(deviceID)).c_str(), "visioverdis");
+    cSysState = SYS_AP_MODE;
+    lastServerOffline = millis();
+    break;
+
+  case SYS_AP_MODE:
+    dnsServer.processNextRequest();
+    webServer.handleClient();
+    sampleData();
+
+    if (millis() - sysStateMillis > 5000)
+    {
+      sysStateMillis = millis();
+      if (receiveActions())
       {
-        String erg = myDoc["result"];
-        if (erg == "OK")
-        {
-          serverStatus = 1;
-          KMPProDinoESP32.setStatusLed(green);
-          lastServerOnline = millis();
-          Serial.println("Transmit Success");
-        }
+        serverStatus = 1;
+      }
+      else
+      {
+        serverStatus = 0;
+        lastServerOffline = millis();
       }
     }
-    else
-    {
-      Serial.println("Connection Failed");
-      KMPProDinoESP32.setStatusLed(red);
-    }
-  }
 
-  if (millis() - updateSensorMillis > (1000))
-  {
-    updateSensorMillis = millis();
-    updateSensorData();
+    if (millis() - lastServerOffline > 30000)
+    {
+      cSysState = SYS_DISCONNECT_NET;
+    }
+
+    break;
+
+  default:
+    KMPProDinoESP32.setStatusLed(red);
+    cSysState = SYS_SAMPLE_DATA;
+    break;
   }
 
   switch (cActionState)
@@ -774,14 +907,11 @@ void loop()
           // recovery mode
           if (apDisabled)
           {
-            apDisabled = 0;
-            Serial.println("Starting Recovery Mode!");
-            WiFi.softAP(("VV_SB_" + String(deviceID)).c_str(), "visioverdis");
+            cSysState = SYS_AP_MODE_START;
           }
+          cActionState = ACT_COMPLETED;
         }
       }
-
-      pendingAction = false;
       actionMillis = millis();
     }
 
@@ -842,7 +972,7 @@ void loop()
 
       Serial.println(respBuff);
 
-      cActionState = ACT_IDLE;
+      cActionState = ACT_COMPLETED;
     }
     break;
 
@@ -850,12 +980,12 @@ void loop()
     if (millis() - actionMillis > 1000)
     {
       actionMillis = millis();
-      
+
       sprintf(reqBuff, "mac=%s&channel=%d&value=%d", deviceID, actionCH, getIOState(actionCH));
       requestServer(currentClient, "http://api.graviplant-online.de", "/steuerbox/v1/actionLog/", reqBuff, respBuff, 2000);
-      
+
       Serial.println(respBuff);
-          
+
       cActionState = ACT_CHANGE;
     }
     break;
@@ -871,9 +1001,14 @@ void loop()
 
       Serial.println(respBuff);
 
-      cActionState = ACT_IDLE;
+      cActionState = ACT_COMPLETED;
     }
-    
+
+    break;
+
+  case ACT_COMPLETED:
+    pendingAction = false;
+    cActionState = ACT_IDLE;
     break;
 
   default:
@@ -886,16 +1021,11 @@ void loop()
     Ethernet.maintain();
   }
 
-  dnsServer.processNextRequest();
-  webServer.handleClient();
-
-  if (millis() - lastServerOnline > 10 * 60 * 1000)
+  if (millis() - lastServerOnline > 30000)
   {
     if (apDisabled)
     {
-      apDisabled = 0;
-      Serial.println("Starting Recovery Mode!");
-      WiFi.softAP(("VV_SB_" + String(deviceID)).c_str(), "visioverdis");
+      cSysState = SYS_AP_MODE_START;
     }
   }
   // put your main code here, to run repeatedly:
@@ -906,10 +1036,10 @@ void updateSensorData()
 
   uint32_t ain0, ain1, ain2, ain3;
 
-  ain0 = readPinCal(PIN_ADC0);
-  ain1 = readPinCal(PIN_ADC1);
-  ain2 = readPinCal(PIN_ADC2);
-  ain3 = readPinCal(PIN_ADC3);
+  ain0 = readPinCal(PIN_ADC0, ADC0);
+  ain1 = readPinCal(PIN_ADC1, ADC1);
+  ain2 = readPinCal(PIN_ADC2, ADC2);
+  ain3 = readPinCal(PIN_ADC3, ADC3);
 
   adc0_filt = ((adc0_filt * 49) + ain0) / 50;
   adc1_filt = ((adc1_filt * 49) + ain1) / 50;
